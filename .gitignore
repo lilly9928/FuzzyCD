@@ -1,0 +1,14 @@
+data/
+output/
+results/
+test_others/
+debug/
+base/
+*.pyc
+ROPE/
+notebook/
+*.pkl
+*.jsonl
+__pycache__/
+PythonEvaluationTools/
+PythonHelperTools/

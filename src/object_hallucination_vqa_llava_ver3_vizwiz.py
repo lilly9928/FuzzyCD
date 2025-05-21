@@ -1,0 +1,267 @@
+import argparse
+import torch
+import os
+import json
+from tqdm import tqdm
+import shortuuid
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# print(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
+from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.conversation import conv_templates, SeparatorStyle
+from llava.model.builder import load_pretrained_model
+from llava.utils import disable_torch_init
+from llava.mm_utils import tokenizer_image_token, get_model_name_from_path, KeywordsStoppingCriteria
+
+from PIL import Image
+import math
+import random
+import numpy as np
+# import kornia
+from transformers import set_seed
+from utils.image_filter import add_filter, add_filter_adjust_sigma
+from utils.sample_ver2 import evolve_vcd_sampling
+evolve_vcd_sampling()
+
+
+
+def membership_init(args,questions,model,tokenizer,image_processor):
+    args.use_FLL = True
+    sample_size = int(len(questions) * 0.1) 
+    sampled_questions =random.sample(questions, sample_size)
+
+    logits_top1 = []
+    logits_top2 = []
+    logits_top10 = []
+    
+    logits_means = []
+    for line in tqdm(sampled_questions):
+        idx = line["image"]
+        image_file = line["image"]
+        qs = line["question"]
+        cur_prompt = qs
+        if model.config.mm_use_im_start_end:
+            qs = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + qs
+        else:
+            qs = DEFAULT_IMAGE_TOKEN + '\n' + qs
+
+        conv = conv_templates[args.conv_mode].copy()
+        conv.append_message(conv.roles[0], qs+"Please answer this question with one word.")
+        conv.append_message(conv.roles[1], None)
+        prompt = conv.get_prompt()
+
+        input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
+        attention_mask = input_ids.ne(tokenizer.pad_token_id).long()
+        
+        image = Image.open(os.path.join("/data3/KJE/Data/vqa/vizwiz/visual_question_answering/Images/train/train/", str(image_file)))
+        image_tensor = image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+
+
+        stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+        keywords = [stop_str]
+        stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
+        
+        with torch.inference_mode():
+            
+            output_logits = model.generate(
+                input_ids,
+                attention_mask=attention_mask,
+                pad_token_id=model.config.eos_token_id,
+                images=image_tensor.unsqueeze(0).half().cuda(),
+                cd_alpha = args.cd_alpha,
+                cd_beta = args.cd_beta,
+                membership_init = True,
+                do_sample=True,
+                temperature=args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+                max_new_tokens=5,
+                use_cache=True,
+                use_cd=args.use_cd,
+                use_FLL=args.use_FLL)
+            
+            mean=output_logits
+            logits_means.append(mean.item())
+    
+    logits_means_mean = np.mean(logits_means)
+    logits_min = np.min(logits_means)
+    logits_max = np.max(logits_means)
+    logits_means_std = np.std(logits_means,ddof=1)    
+
+    return logits_means_mean, logits_means_std, logits_min, logits_max
+
+
+
+
+def eval_model(args):
+    # Model
+    disable_torch_init()
+    model_path = os.path.expanduser(args.model_path)
+    model_name = get_model_name_from_path(model_path)
+    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
+    
+    with open(os.path.expanduser(args.question_file), "r") as f:
+        questions = json.load(f)
+    ###preprocess for membership function 
+    args.use_FLL = False
+    ## for membership function
+    if args.filter_type.startswith('FLL'):
+        args.use_FLL = True
+        logits_means_mean, logits_means_std, logits_min, logits_max = membership_init(args,questions,model,tokenizer,image_processor)
+    else:
+        logits_top_mean = None
+        logits_top_std = None
+        logits_top_min = None
+        logits_top_max = None
+
+    answers_file = os.path.expanduser(args.answers_file)
+    # debug_file = os.path.expanduser(args.debug_file)
+    os.makedirs(os.path.dirname(answers_file), exist_ok=True)
+    ans_file = open(answers_file, "w")
+    # debug_file = open(debug_file, "w")
+
+    vizwiz_sample_ =[]
+    for sample in questions:
+        if sample['image'] == 'VizWiz_train_00000134.jpg':
+            vizwiz_sample_.append(sample)
+
+    for line in tqdm(vizwiz_sample_):
+        
+        idx = line["image"]
+        image_file = line["image"]
+        qs = line["question"]
+        cur_prompt = qs
+        if model.config.mm_use_im_start_end:
+            qs = DEFAULT_IM_START_TOKEN + DEFAULT_IMAGE_TOKEN + DEFAULT_IM_END_TOKEN + '\n' + qs
+        else:
+            qs = DEFAULT_IMAGE_TOKEN + '\n' + qs
+
+        conv = conv_templates[args.conv_mode].copy()
+        conv.append_message(conv.roles[0], qs+"Please answer this question with one word.")
+        conv.append_message(conv.roles[1], None)
+        prompt = conv.get_prompt()
+        # print(prompt)
+
+        input_ids = tokenizer_image_token(prompt, tokenizer, IMAGE_TOKEN_INDEX, return_tensors='pt').unsqueeze(0).cuda()
+        attention_mask = input_ids.ne(tokenizer.pad_token_id).long()
+        image = Image.open(os.path.join("/data3/KJE/Data/vqa/vizwiz/visual_question_answering/Images/train/train/", str(image_file)))
+        
+        image_tensor = image_processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+        
+        if args.use_cd:
+            image_tensors = [image_tensor]
+            if args.use_FLL:
+                filter_images = add_filter(args,image_file=image_file, image_processor=image_processor)
+            else:
+                filter_images = add_filter_adjust_sigma(args,image_file=image_file, sigma=args.sigma, image_processor=image_processor)
+            for filter_image in filter_images:
+                if "diffusion" in args.filter_type:
+                    image_tensors.append(filter_image)
+                else:
+                    image_tensors.append(image_processor.preprocess(filter_image, return_tensors='pt')['pixel_values'][0])
+            image_tensors = torch.stack(image_tensors, dim=0)
+        else:
+            image_tensor_cd = None     
+        stop_str = conv.sep if conv.sep_style != SeparatorStyle.TWO else conv.sep2
+        keywords = [stop_str]
+        stopping_criteria = KeywordsStoppingCriteria(keywords, tokenizer, input_ids)
+        
+        with torch.inference_mode():
+                output_ids,mynext_token_logits_list,next_token_logits_list,debug_rule = model.generate(
+                    input_ids,
+                    attention_mask = attention_mask, 
+                    pad_token_id = model.config.eos_token_id,
+                    images = image_tensors.half().cuda(),
+                    # images_1=(image_tensors[0].unsqueeze(0).half().cuda() if image_tensors is not None else None),
+                    # images_2=(image_tensors[1].unsqueeze(0).half().cuda() if image_tensors is not None else None),
+                    # images_3=(image_tensors[2].unsqueeze(0).half().cuda() if image_tensors is not None else None),
+                    # images_4=(image_tensors[3].unsqueeze(0).half().cuda() if image_tensors is not None else None),
+                    cd_alpha = args.cd_alpha,
+                    cd_beta = args.cd_beta,
+                    do_sample=True,
+                    membership_init = False,
+                    temperature = args.temperature,
+                    top_p = args.top_p,
+                    top_k = args.top_k,
+                    max_new_tokens = 5,
+                    logits_top_mean = logits_means_mean,
+                    logits_top_std = logits_means_std,
+                    logits_top_min = logits_min,
+                    logits_top_max = logits_max,
+                    use_cache = True,
+                    use_cd = args.use_cd,
+                    use_FLL = args.use_FLL,
+                    )
+
+        # print(output_ids)
+        input_token_len = input_ids.shape[1]
+        # print(input_token_len)
+        # print(output_ids[:, :input_token_len:])
+    
+        n_diff_input_output = (input_ids != output_ids[:, :input_token_len]).sum().item()
+        if n_diff_input_output > 0:
+            print(f'[Warning] {n_diff_input_output} output_ids are not the same as the input_ids')
+        outputs = tokenizer.batch_decode(output_ids[:, input_token_len:], skip_special_tokens=True)[0]
+        # print(outputs)
+        outputs = outputs.strip()
+        if outputs.endswith(stop_str):
+            outputs = outputs[:-len(stop_str)]
+        outputs = outputs.strip()
+
+        # fuzzy_decoding_result=output_ids['fuzzydecoding']
+
+        ans_file.write(json.dumps({"image_id": idx,
+                                   "prompt": cur_prompt,
+                                   "text": outputs,
+                                   "model_id": model_name,
+                                   "image": image_file,
+                                   "debug_rule":debug_rule,
+                                   "metadata": {}}) + "\n")
+        
+        # # import pdb;pdb.set_trace()
+        # debug_file.write(json.dumps({"image_id": idx,
+        #                            "prompt": cur_prompt,
+        #                            "text": outputs,
+        #                            "orignal_next_tokens": fuzzy_decoding_result['orignal_next_tokens'],
+        #                            "top10_logits": fuzzy_decoding_result['top10_logits'],
+        #                             "top10_token": tokenizer.batch_decode(fuzzy_decoding_result['top10_token'][0][0]),
+        #                             "top10_low": fuzzy_decoding_result['top10_low'],
+        #                             "top10_high": fuzzy_decoding_result['top10_high'],
+        #                             "filter_top10_logits": tokenizer.batch_decode(fuzzy_decoding_result['filter_top10_token'][0][0]),
+        #                             "filter_top10_token": fuzzy_decoding_result['filter_top10_logits'],
+        #                             "filter_top10_low": fuzzy_decoding_result['filter_top10_low'],
+        #                             "filter_top10_high": fuzzy_decoding_result['filter_top10_high']
+        #                            }) + "\n")
+        ans_file.flush()
+        # debug_file.flush()
+    ans_file.close()
+    # debug_file.close()
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model-path", type=str, default="facebook/opt-350m")
+    parser.add_argument("--model-base", type=str, default=None)
+    parser.add_argument("--image-folder", type=str, default="")
+    parser.add_argument("--question-file", type=str, default="tables/question.jsonl")
+    parser.add_argument("--answers-file", type=str, default="answer.jsonl")
+    parser.add_argument("--debug-file", type=str, default="debug.jsonl")
+    parser.add_argument("--conv-mode", type=str, default="llava_v1")
+    parser.add_argument("--num-chunks", type=int, default=1)
+    parser.add_argument("--chunk-idx", type=int, default=0)
+    parser.add_argument("--temperature", type=float, default=1.0)
+    parser.add_argument("--top_p", type=float, default=1)
+    parser.add_argument("--top_k", type=int, default=None)
+
+    parser.add_argument("--noise_step", type=int, default=500)
+    parser.add_argument("--filter_type", type=str, default='FLL+diffusion', help="Filter type", choices=["FLL+gussian", "FLL+median", "FLL+sharpen", "FLL+sobel", "FLL+bilateral", "FLL+diffusion", "gaussian", "median", "sharpen", "sobel", "diffusion"])
+    parser.add_argument("--use_cd", action='store_true', default=True)
+    parser.add_argument("--cd_alpha", type=float, default=1)
+    parser.add_argument("--cd_beta", type=float, default=0.1)
+    parser.add_argument("--sigma", type=int, default=200)
+    parser.add_argument("--seed", type=int, default=42)
+    
+    args = parser.parse_args()
+    set_seed(args.seed)
+    eval_model(args)

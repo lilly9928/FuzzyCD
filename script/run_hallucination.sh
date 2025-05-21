@@ -1,0 +1,2 @@
+CUDA_VISIBLE_DEVICES=2
+python src/run_hallucination_detection.py
